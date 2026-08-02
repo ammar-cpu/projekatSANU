@@ -45,12 +45,14 @@ def parse_vrp(path):
             elif depot_raw_id is None:
                 depot_raw_id = value
 
-    # depot is always remapped to index 0, customers keep ascending order after it
+    # the depot moves to index 0, customers keep ascending file order after it
     order = [depot_raw_id] + sorted(i for i in raw_coords if i != depot_raw_id)
 
+    coords = np.array([raw_coords[i] for i in order])
     return {
-        "coords": np.array([raw_coords[i] for i in order]),
+        "coords": coords,
         "demands": np.array([raw_demands[i] for i in order]),
+        "dist": compute_distance_matrix(coords),
         "capacity": capacity,
         "depot_id": 0,
         "dimension": dimension,
@@ -58,8 +60,8 @@ def parse_vrp(path):
 
 
 def compute_distance_matrix(coords):
-    # TSPLIB EUC_2D convention: distances are rounded to the nearest integer.
-    # CVRPLIB optima for the Augerat sets are stated under this convention, so
-    # without the rounding the gap to optimum is not comparable.
+    # TSPLIB EUC_2D convention: distances rounded to the nearest integer. The
+    # published CVRPLIB optima assume this, so without the rounding the gap to
+    # optimum is not comparable.
     diff = coords[:, None, :] - coords[None, :, :]
     return np.round(np.sqrt((diff ** 2).sum(axis=-1)))
