@@ -1,5 +1,6 @@
 import random
 import signal
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -20,12 +21,27 @@ from qvnd.local_search import (
     two_opt,
     two_opt_delta,
 )
+from qvnd.experiments import (
+    ARMS,
+    format_comparisons,
+    format_summary,
+    make_selector,
+    paired_comparison,
+    run_batch,
+    run_single,
+    save_results_csv,
+    summarize,
+)
+from qvnd.gvns import SHAKE_E, gvns, shake
+from qvnd.qlearning import N_STATES, QAgent
 from qvnd.vnd import (
     DEFAULT_NEIGHBORHOODS,
     EARLY,
     LATE,
     MID,
     FixedSelector,
+    RandomSelector,
+    elapsed_progress,
     phase_of,
     vnd,
 )
@@ -58,6 +74,31 @@ def time_limit(seconds):
 # pairwise distance used below is an exact integer
 FIXTURE_COORDS = np.array([[0.0, 0.0], [0.0, 3.0], [4.0, 3.0], [4.0, 0.0]])
 FIXTURE_DIST = compute_distance_matrix(FIXTURE_COORDS)
+
+
+def test_parse_reads_name_and_optimum():
+    inst = parse_vrp(INSTANCE)
+    assert inst["name"] == "A-n32-k5"
+    assert inst["optimum"] == 784  # taken from the COMMENT line, not a separate table
+
+
+def test_every_instance_parses_and_is_solvable():
+    # the whole Augerat A set, not just the three the earlier tests use
+    files = sorted((INSTANCE.parent).glob("*.vrp"))
+    assert len(files) == 27
+
+    for path in files:
+        inst = parse_vrp(path)
+        assert inst["optimum"] > 0
+        assert len(inst["coords"]) == inst["dimension"] == len(inst["demands"])
+        assert inst["demands"][inst["depot_id"]] == 0
+
+        routes = initial_solution_nearest_neighbor(
+            inst["coords"], inst["demands"], inst["capacity"], inst["depot_id"], inst["dist"]
+        )
+        assert is_feasible(routes, inst["demands"], inst["capacity"])
+        # a construction has to be worse than the optimum, never better
+        assert cost(routes, inst["dist"]) >= inst["optimum"]
 
 
 def test_parse_node_count_and_capacity():
@@ -815,17 +856,6 @@ class _RecordingSelector:
         self.updates.append((state, action, reward, next_state))
 
 
-class _RandomSelector:
-    def __init__(self, seed):
-        self.rng = random.Random(seed)
-
-    def pick(self, state, available):
-        return self.rng.choice(available)
-
-    def update(self, state, action, reward, next_state):
-        pass
-
-
 def test_phase_of_thirds():
     assert phase_of(0.0) == EARLY
     assert phase_of(0.32) == EARLY
@@ -920,11 +950,64 @@ def test_vnd_terminates_under_any_selector():
     for seed in range(5):
         sol = _nn_solution(inst)
         with time_limit(30):
-            stats = vnd(inst, sol, DEFAULT_NEIGHBORHOODS, _RandomSelector(seed))
+            stats = vnd(inst, sol, DEFAULT_NEIGHBORHOODS, RandomSelector(seed))
         for neighborhood in DEFAULT_NEIGHBORHOODS:
             assert not neighborhood(inst, sol)
         assert stats.steps > 0
         assert is_feasible(sol.routes, inst["demands"], inst["capacity"])
+
+
+def test_vnd_progress_number_freezes_the_phase():
+    inst = parse_vrp(INSTANCE)
+    sol = _nn_solution(inst)
+    selector = _RecordingSelector()
+
+    with time_limit(30):
+        vnd(inst, sol, DEFAULT_NEIGHBORHOODS, selector, progress=0.5)
+
+    assert {state[0] for state, _, _ in selector.picks} == {MID}
+
+
+def test_vnd_progress_callable_is_read_every_iteration():
+    # a callable is re-read on each pick and again after each move, so the phase
+    # tracks the run instead of being fixed when vnd was entered
+    reads = []
+
+    def creeping_progress():
+        reads.append(len(reads))
+        return len(reads) / 40.0  # crosses both thirds within one VND call
+
+    inst = parse_vrp(INSTANCE)
+    sol = _nn_solution(inst)
+    selector = _RecordingSelector()
+
+    with time_limit(30):
+        vnd(inst, sol, DEFAULT_NEIGHBORHOODS, selector, progress=creeping_progress)
+
+    assert len(reads) == 2 * len(selector.picks)  # once per pick, once per update
+    assert {state[0] for state, _, _ in selector.picks} == {EARLY, MID, LATE}
+    # phases only ever move forward
+    phases = [state[0] for state, _, _ in selector.picks]
+    assert phases == sorted(phases)
+
+
+def test_elapsed_progress_tracks_the_clock():
+    read = elapsed_progress(start=time.time() - 15.0, budget=30.0)
+    assert 0.45 < read() < 0.55
+    assert phase_of(read()) == MID
+
+    finished = elapsed_progress(start=time.time() - 60.0, budget=30.0)
+    assert finished() == 1.0  # clamped, never runs past the end of the budget
+
+
+def test_random_selector_only_picks_available_and_is_seeded():
+    first = RandomSelector(seed=11)
+    second = RandomSelector(seed=11)
+    for _ in range(50):
+        available = [0, 2, 4]
+        choice = first.pick((EARLY, 0), available)
+        assert choice in available
+        assert choice == second.pick((EARLY, 0), available)
 
 
 def test_vnd_rejects_a_selector_that_ignores_availability():
@@ -944,6 +1027,432 @@ def test_vnd_rejects_a_selector_that_ignores_availability():
         except ValueError:
             return
     raise AssertionError("expected ValueError when the selector ignores `available`")
+
+
+def _agent(n_actions=len(DEFAULT_NEIGHBORHOODS), **kwargs):
+    settings = dict(alpha=0.1, gamma=0.9, eps_start=0.9, eps_end=0.05, seed=3)
+    settings.update(kwargs)
+    return QAgent(n_actions, **settings)
+
+
+def test_qagent_table_shape_and_state_indexing():
+    agent = _agent()
+    assert agent.q.shape == (N_STATES, len(DEFAULT_NEIGHBORHOODS)) == (6, 5)
+    assert not agent.q.any()
+
+    seen = {agent.get_state(phase, improved)
+            for phase in (EARLY, MID, LATE) for improved in (0, 1)}
+    assert seen == set(range(N_STATES))  # the six states map onto distinct rows
+
+
+def test_qagent_epsilon_decays_on_the_budget_not_on_steps():
+    agent = _agent(eps_start=1.0, eps_end=0.0)
+    assert agent.epsilon == 1.0  # no clock attached yet
+
+    consumed = [0.0]
+    agent.set_progress(lambda: consumed[0])
+    for fraction, expected in [(0.0, 1.0), (0.25, 0.75), (0.5, 0.5), (1.0, 0.0)]:
+        consumed[0] = fraction
+        assert abs(agent.epsilon - expected) < 1e-12
+
+    consumed[0] = 5.0
+    assert agent.epsilon == 0.0  # clamped, never runs past eps_end
+
+    # step count must not enter into it: the arms differ in steps by up to 2x
+    consumed[0] = 0.5
+    agent.steps = 10_000
+    assert abs(agent.epsilon - 0.5) < 1e-12
+
+
+def test_qagent_update_matches_the_formula():
+    agent = _agent(alpha=0.5, gamma=0.9)
+
+    # first update off a zero table: target = 1.0 + 0.9 * 0
+    agent.update((EARLY, 0), 2, 1.0, (MID, 1))
+    assert abs(agent.q[0, 2] - 0.5) < 1e-12
+    assert agent.steps == 1
+
+    # second update bootstraps off the best value in the next state's row
+    agent.q[agent.get_state(MID, 1)] = [0.0, 0.0, 2.0, 0.0, 0.0]
+    agent.update((EARLY, 0), 2, 1.0, (MID, 1))
+    assert abs(agent.q[0, 2] - 1.65) < 1e-12  # 0.5 + 0.5 * (1.0 + 0.9*2.0 - 0.5)
+
+
+def test_qagent_never_picks_outside_available():
+    agent = _agent(eps_start=0.0, eps_end=0.0)  # pure greedy
+    # action 0 is by far the best, but it is not on offer
+    agent.q[agent.get_state(EARLY, 0)] = [9.0, 1.0, 0.5, 0.2, 0.1]
+    for _ in range(100):
+        assert agent.pick((EARLY, 0), [1, 2, 3]) in (1, 2, 3)
+
+    exploring = _agent(eps_start=1.0, eps_end=1.0)  # pure exploration
+    for _ in range(100):
+        assert exploring.pick((EARLY, 0), [2, 4]) in (2, 4)
+
+
+def test_qagent_greedy_picks_the_best_available():
+    agent = _agent(eps_start=0.0, eps_end=0.0)
+    agent.q[agent.get_state(LATE, 1)] = [0.1, 0.7, 0.2, 0.9, 0.3]
+    assert agent.pick((LATE, 1), [0, 1, 2]) == 1
+    assert agent.pick((LATE, 1), [0, 2, 3]) == 3
+    assert agent.pick((LATE, 1), [0, 2]) == 2
+
+
+def test_qagent_zero_table_does_not_collapse_to_the_fixed_order():
+    # with every value tied at zero a first-index rule would make the greedy branch
+    # a copy of FixedSelector, and the two arms would be indistinguishable at the start
+    agent = _agent(eps_start=0.0, eps_end=0.0)
+    picks = {agent.pick((EARLY, 0), [0, 1, 2, 3, 4]) for _ in range(200)}
+    assert picks == {0, 1, 2, 3, 4}
+
+
+def test_qagent_table_evolves_across_shared_vnd_calls():
+    # one agent for the whole run: the table is the learned state and must survive
+    # from one vnd() call to the next
+    inst = parse_vrp(INSTANCE)
+    agent = _agent()
+    consumed = [0.0]
+    agent.set_progress(lambda: consumed[0])
+    before = agent.q.copy()
+
+    calls = 25
+    total_steps = 0
+    with time_limit(60):
+        for call in range(calls):
+            consumed[0] = call / calls
+            sol = _nn_solution(inst)
+            stats = vnd(inst, sol, DEFAULT_NEIGHBORHOODS, agent, progress=call / calls)
+            total_steps += stats.steps
+            assert is_feasible(sol.routes, inst["demands"], inst["capacity"])
+
+    assert agent.q.any(), "Q-table stayed all zeros"
+    assert not np.array_equal(agent.q, before)
+    assert agent.steps == total_steps          # one learning step per vnd iteration
+    assert agent.epsilon < 0.9                 # epsilon actually decayed
+    # sweeping progress across the run has to reach every phase
+    assert (np.abs(agent.q).sum(axis=1) > 0).sum() == N_STATES
+
+
+def test_qvnd_behaves_like_the_other_selectors():
+    inst = parse_vrp(INSTANCE)
+    arms = {
+        "fixed": FixedSelector(),
+        "random": RandomSelector(seed=5),
+        "q": _agent(),
+    }
+    with time_limit(60):
+        for selector in arms.values():
+            for call in range(5):
+                sol = _nn_solution(inst)
+                vnd(inst, sol, DEFAULT_NEIGHBORHOODS, selector, progress=call / 5)
+                # same postcondition regardless of who chose the neighborhoods
+                for neighborhood in DEFAULT_NEIGHBORHOODS:
+                    assert not neighborhood(inst, sol)
+                true_cost, true_load = sol.recompute(inst)
+                assert abs(sol.cost - true_cost) < 1e-6
+                assert sol.load == true_load
+                assert is_feasible(sol.routes, inst["demands"], inst["capacity"])
+
+
+def test_shake_keeps_cost_and_load_in_step_with_routes():
+    # shake ignores cost when choosing, but the values Solution carries still have
+    # to match the routes afterwards, or every later delta is built on a wrong base
+    inst = parse_vrp(INSTANCE)
+    rng = random.Random(4)
+    for k in (1, 3, 7, 12):
+        sol = _nn_solution(inst)
+        shake(inst, sol, k, SHAKE_E, rng)
+        true_cost, true_load = sol.recompute(inst)
+        assert abs(sol.cost - true_cost) < 1e-6
+        assert sol.load == true_load
+
+
+def test_shake_preserves_every_customer():
+    inst = parse_vrp(INSTANCE)
+    expected = set(range(1, len(inst["demands"])))
+    rng = random.Random(5)
+    for k in range(1, 15):
+        sol = _nn_solution(inst)
+        shake(inst, sol, k, SHAKE_E, rng)
+        placed = [c for route in sol.routes for c in route]
+        assert sorted(placed) == sorted(expected)  # nothing lost or duplicated
+
+
+def test_shake_actually_changes_the_solution():
+    # a single move can land back where it started (same route, same slot, no
+    # reversal), so a small k is not guaranteed to change anything; with k this
+    # large every shake has to leave a mark
+    inst = parse_vrp(INSTANCE)
+    rng = random.Random(6)
+    for _ in range(20):
+        sol = _nn_solution(inst)
+        before = [list(route) for route in sol.routes]
+        shake(inst, sol, 10, SHAKE_E, rng)
+        assert sol.routes != before
+
+
+def test_shake_keeps_capacity():
+    # a target route is only taken when the segment fits, so a feasible solution
+    # stays feasible however hard it is shaken
+    rng = random.Random(7)
+    for name in ("A-n32-k5", "A-n65-k9", "A-n80-k10"):
+        inst = parse_vrp(INSTANCE.parent / f"{name}.vrp")
+        for k in (1, 5, 12):
+            sol = Solution(
+                initial_solution_nearest_neighbor(
+                    inst["coords"], inst["demands"], inst["capacity"],
+                    inst["depot_id"], inst["dist"]
+                ),
+                inst,
+            )
+            shake(inst, sol, k, SHAKE_E, rng)
+            assert is_feasible(sol.routes, inst["demands"], inst["capacity"])
+
+
+def test_shake_source_route_stays_eligible_when_full():
+    # every route at capacity: a segment still has somewhere to go, because moving it
+    # inside its own route shifts no load at all. Testing the source route with the
+    # same load + demand <= capacity rule as the others would double-count the
+    # segment and wrongly rule it out.
+    coords = [[0, 0]] + [[i, i % 3] for i in range(1, 13)]
+    inst = _toy_inst(coords, [0] + [20] * 12, capacity=120)
+    sol = Solution([[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]], inst)
+    assert sol.load == [120, 120]
+
+    reversals = shake(inst, sol, 20, SHAKE_E, random.Random(8))
+    assert reversals == 0  # nothing was forced, the source route absorbed every move
+    assert sol.load == [120, 120]
+    assert sorted(c for route in sol.routes for c in route) == list(range(1, 13))
+    assert is_feasible(sol.routes, inst["demands"], inst["capacity"])
+
+
+def test_shake_reverse_probability_controls_in_place_moves():
+    inst = parse_vrp(INSTANCE)
+
+    sol = _nn_solution(inst)
+    assert shake(inst, sol, 50, SHAKE_E, random.Random(1), reverse_p=0.0) == 0
+
+    sol = _nn_solution(inst)
+    assert shake(inst, sol, 50, SHAKE_E, random.Random(1), reverse_p=1.0) == 50
+
+    sol = _nn_solution(inst)
+    half = shake(inst, sol, 400, SHAKE_E, random.Random(1), reverse_p=0.5)
+    assert 160 < half < 240  # roughly half, well away from either extreme
+
+
+def test_shake_in_place_reversal_leaves_load_untouched():
+    # the whole point of the reversal branch: it perturbs order without shifting load
+    inst = parse_vrp(INSTANCE)
+    sol = _nn_solution(inst)
+    before_load = list(sol.load)
+    before_sets = [set(route) for route in sol.routes]
+
+    shake(inst, sol, 30, SHAKE_E, random.Random(2), reverse_p=1.0)
+
+    assert sol.load == before_load
+    assert [set(route) for route in sol.routes] == before_sets
+    true_cost, true_load = sol.recompute(inst)
+    assert abs(sol.cost - true_cost) < 1e-6
+    assert sol.load == true_load
+
+
+def test_gvns_returns_a_feasible_best_within_budget():
+    inst = parse_vrp(INSTANCE)
+    started = time.time()
+    best, stats = gvns(inst, RandomSelector(seed=1), seed=1, budget_seconds=2.0)
+    elapsed = time.time() - started
+
+    assert 2.0 <= elapsed < 4.0  # stops on the budget, one VND call may overrun it
+    assert stats.iterations > 0
+    assert is_feasible(best.routes, inst["demands"], inst["capacity"])
+    true_cost, true_load = best.recompute(inst)
+    assert abs(best.cost - true_cost) < 1e-6
+    assert best.load == true_load
+
+
+def test_gvns_requires_exactly_one_stopping_mode():
+    inst = parse_vrp(INSTANCE)
+    for kwargs in ({}, {"budget_seconds": 1.0, "max_iterations": 10}):
+        try:
+            gvns(inst, FixedSelector(), seed=0, **kwargs)
+        except ValueError:
+            continue
+        raise AssertionError(f"expected ValueError for {kwargs}")
+
+
+def test_gvns_iteration_mode_runs_exactly_that_many():
+    inst = parse_vrp(INSTANCE)
+    for wanted in (5, 25):
+        _, stats = gvns(inst, RandomSelector(seed=0), seed=0, max_iterations=wanted)
+        assert stats.iterations == wanted
+
+
+def test_gvns_iteration_mode_is_reproducible():
+    # nothing in this mode reads the clock, so the same seed has to give the same
+    # answer run to run; this is what makes it usable for regression checks
+    inst = parse_vrp(INSTANCE)
+    for arm in ("fixed", "random"):
+        runs = []
+        for _ in range(2):
+            best, stats = gvns(inst, make_selector(arm, 0), seed=0, max_iterations=40)
+            runs.append((best.cost, [list(r) for r in best.routes],
+                         stats.iterations, stats.accepted, stats.vnd_steps))
+        assert runs[0] == runs[1], arm
+
+
+def test_gvns_timed_and_iteration_modes_agree_on_the_phase_feature():
+    # the phase has to advance in both modes, otherwise a run in iteration mode
+    # would leave the agent's state feature stuck
+    inst = parse_vrp(INSTANCE)
+    seen = []
+
+    class Watcher:
+        def pick(self, state, available):
+            seen.append(state[0])
+            return min(available)
+
+        def update(self, state, action, reward, next_state):
+            pass
+
+    gvns(inst, Watcher(), seed=0, max_iterations=60)
+    assert {EARLY, MID, LATE} <= set(seen)
+
+
+def test_run_single_records_the_stopping_mode():
+    row = run_single(INSTANCE, "fixed", seed=0, max_iterations=15)
+    assert row["mode"] == "iterations"
+    assert row["max_iterations"] == 15 and row["time_budget"] == ""
+    assert row["iterations"] == 15
+
+    try:
+        run_single(INSTANCE, "fixed", seed=0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError when no stopping mode is given")
+
+
+def test_gvns_never_returns_worse_than_the_first_local_optimum():
+    inst = parse_vrp(INSTANCE)
+    plain = _nn_solution(inst)
+    vnd(inst, plain, DEFAULT_NEIGHBORHOODS, FixedSelector())
+
+    best, _ = gvns(inst, FixedSelector(), seed=2, budget_seconds=2.0)
+    assert best.cost <= plain.cost  # acceptance is strictly-better, so it cannot regress
+
+
+def test_gvns_shares_one_agent_across_the_whole_run():
+    inst = parse_vrp(INSTANCE)
+    agent = _agent()
+    best, stats = gvns(inst, agent, seed=3, budget_seconds=2.0)
+
+    assert agent.steps == stats.vnd_steps      # every VND step went through this agent
+    assert agent.q.any()                       # and the table it built survived the run
+    assert agent.epsilon < 0.9                 # gvns handed it the run clock
+    assert is_feasible(best.routes, inst["demands"], inst["capacity"])
+
+
+def test_gvns_k_wraps_around_instead_of_growing_without_bound():
+    # k climbs on every rejection; with a small k_max it has to wrap back to k_min
+    # rather than run away, which a long budget with few accepts would expose
+    inst = parse_vrp(INSTANCE)
+    sizes = []
+
+    original_shake = gvns.__globals__["shake"]
+
+    def spy(inst_, sol, k, e, rng, reverse_p=0.0):
+        sizes.append(k)
+        return original_shake(inst_, sol, k, e, rng, reverse_p)
+
+    gvns.__globals__["shake"] = spy
+    try:
+        gvns(inst, FixedSelector(), seed=4, budget_seconds=2.0, k_min=1, k_step=1, k_max=4)
+    finally:
+        gvns.__globals__["shake"] = original_shake
+
+    assert sizes
+    assert min(sizes) == 1 and max(sizes) <= 4
+    assert sizes.count(1) > 1  # wrapped back round at least once
+
+
+def test_make_selector_covers_every_arm():
+    for arm in ARMS:
+        selector = make_selector(arm, seed=0)
+        assert callable(selector.pick) and callable(selector.update)
+        assert selector.pick((EARLY, 0), [1, 3]) in (1, 3)
+
+    try:
+        make_selector("greedy", seed=0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError for an unknown arm")
+
+
+def test_run_single_records_result_and_configuration():
+    row = run_single(INSTANCE, "q", seed=0, budget_seconds=2.0,
+                     search={"reverse_p": 0.25, "k_max": 7}, agent={"alpha": 0.3})
+
+    assert row["instance"] == "A-n32-k5" and row["optimum"] == 784
+    assert row["arm"] == "q" and row["seed"] == 0
+    assert row["cost"] >= row["optimum"]
+    assert abs(row["gap"] - 100 * (row["cost"] - 784) / 784) < 1e-9
+    assert row["iterations"] > 0 and row["vnd_steps"] > 0
+    assert row["infeasible"] == 0
+
+    # the configuration travels with the result, including the defaults not passed in
+    assert row["cfg_reverse_p"] == 0.25 and row["cfg_k_max"] == 7
+    assert row["cfg_alpha"] == 0.3 and row["cfg_gamma"] == 0.9
+    assert row["cfg_reward"] == "improvement"
+    assert row["mode"] == "time" and row["time_budget"] == 2.0
+    assert sum(row[f"calls_{f.__name__}"] for f in DEFAULT_NEIGHBORHOODS) == row["vnd_steps"]
+
+
+def test_run_batch_covers_the_grid_and_writes_a_documented_csv(tmp_path=None):
+    import csv as _csv
+    import json as _json
+    import tempfile
+
+    rows = run_batch([INSTANCE], ["fixed", "random"], range(2), budget_seconds=1.0, log=None)
+    assert len(rows) == 4
+    assert {(r["arm"], r["seed"]) for r in rows} == {("fixed", 0), ("fixed", 1),
+                                                     ("random", 0), ("random", 1)}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        target = save_results_csv(rows, Path(tmp) / "out.csv")
+        back = list(_csv.DictReader(target.open()))
+        assert len(back) == 4
+        assert back[0]["instance"] == "A-n32-k5"
+
+        meta = _json.loads(target.with_suffix(".json").read_text())
+        assert meta["runs"] == 4 and meta["arms"] == ["fixed", "random"]
+        assert meta["seeds"] == [0, 1] and meta["time_budget"] == 1.0
+        assert meta["mode"] == "time" and meta["comparable_across_arms"] is True
+        assert meta["config"]["cfg_reward"] == "improvement"
+        assert len(meta["neighborhoods"]) == len(DEFAULT_NEIGHBORHOODS)
+
+
+def test_summarize_and_paired_comparison_on_known_numbers():
+    def row(instance, arm, seed, cost):
+        return {"instance": instance, "arm": arm, "seed": seed,
+                "cost": cost, "optimum": 100}
+
+    rows = [row("X", "fixed", 0, 110), row("X", "fixed", 1, 130),
+            row("X", "q", 0, 105), row("X", "q", 1, 115)]
+
+    fixed, q = summarize(rows)
+    assert (fixed["arm"], fixed["best"], fixed["mean"]) == ("fixed", 110, 120.0)
+    assert abs(fixed["gap_mean"] - 20.0) < 1e-9
+    assert (q["arm"], q["best"], q["mean"]) == ("q", 105, 110.0)
+    assert abs(q["gap_best"] - 5.0) < 1e-9
+
+    c = paired_comparison(rows, "q", "fixed")
+    assert c["n"] == 2 and c["wins"] == 2 and c["losses"] == 0
+    assert abs(c["mean_diff"] - (-10.0)) < 1e-9   # (105-110) and (115-130) -> -5, -15
+    assert c["t"] < 0
+
+    assert paired_comparison(rows, "q", "random") is None  # arm absent
+    assert "fixed" in format_summary(rows) and "q" in format_comparisons(rows)
 
 
 if __name__ == "__main__":

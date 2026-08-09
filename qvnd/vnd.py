@@ -1,3 +1,6 @@
+import random
+import time
+
 from .local_search import cross_exchange, or_opt, relocate, swap, two_opt
 
 DEFAULT_NEIGHBORHOODS = (relocate, swap, two_opt, or_opt, cross_exchange)
@@ -14,6 +17,30 @@ def phase_of(progress):
     if progress < 2 / 3:
         return MID
     return LATE
+
+
+def _progress_reader(progress):
+    # a plain number freezes the phase for the whole call, which is what standalone
+    # runs and tests want. A zero-argument callable is read again on every iteration,
+    # so a caller holding the wall clock can let the phase move mid-call.
+    if callable(progress):
+        return progress
+    return lambda: progress
+
+
+def elapsed_progress(start, budget):
+    # the callable GVNS passes in: fraction of the time budget consumed so far
+    return lambda: min(1.0, (time.time() - start) / budget) if budget > 0 else 1.0
+
+
+def improvement_reward(gain, cost_before, improved, failure_penalty):
+    # relative drop in cost, so the scale does not depend on the instance
+    if not improved:
+        return failure_penalty
+    return gain / cost_before if cost_before > 0 else 0.0
+
+
+REWARDS = {"improvement": improvement_reward}
 
 
 class VndStats:
@@ -44,11 +71,25 @@ class FixedSelector:
         pass
 
 
-def vnd(inst, sol, neighborhoods, selector, progress=0.0, failure_penalty=0.0):
+class RandomSelector:
+    # uniform choice among the neighborhoods still eligible. This is the control
+    # arm: a Q-agent that cannot beat an unbiased choice has learned nothing.
+    def __init__(self, seed=None):
+        self.rng = random.Random(seed)
+
+    def pick(self, state, available):
+        return self.rng.choice(available)
+
+    def update(self, state, action, reward, next_state):
+        pass
+
+
+def vnd(inst, sol, neighborhoods, selector, progress=0.0, failure_penalty=0.0,
+        reward=improvement_reward):
     # `selector` decides which neighborhood to try next. FixedSelector reproduces the
     # baseline and a Q-agent plugs into the same interface, keeping the comparison fair.
     stats = VndStats(len(neighborhoods))
-    phase = phase_of(progress)
+    read_progress = _progress_reader(progress)
     improved_previously = 0
 
     # a neighborhood that failed on the current solution fails again until the
@@ -58,7 +99,7 @@ def vnd(inst, sol, neighborhoods, selector, progress=0.0, failure_penalty=0.0):
 
     while len(exhausted) < len(neighborhoods):
         available = [a for a in range(len(neighborhoods)) if a not in exhausted]
-        state = (phase, improved_previously)
+        state = (phase_of(read_progress()), improved_previously)
 
         action = selector.pick(state, available)
         if action not in available:
@@ -72,14 +113,15 @@ def vnd(inst, sol, neighborhoods, selector, progress=0.0, failure_penalty=0.0):
 
         if improved:
             exhausted.clear()
-            reward = gain / before if before > 0 else 0.0
         else:
             exhausted.add(action)
-            reward = failure_penalty
 
+        value = reward(gain, before, improved, failure_penalty)
         improved_previously = 1 if improved else 0
-        next_state = (phase, improved_previously)
-        selector.update(state, action, reward, next_state)
+        # read again after the move: at a phase boundary the agent transitions into
+        # the new phase, and that is the state the Q-update has to bootstrap from
+        next_state = (phase_of(read_progress()), improved_previously)
+        selector.update(state, action, value, next_state)
         stats.record(action, improved, gain)
 
     return stats

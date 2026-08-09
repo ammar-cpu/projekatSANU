@@ -1,3 +1,5 @@
+import re
+
 import numpy as np
 
 
@@ -7,6 +9,8 @@ def parse_vrp(path):
 
     dimension = None
     capacity = None
+    optimum = None
+    name = None
     section = None
     raw_coords = {}
     raw_demands = {}
@@ -32,6 +36,14 @@ def parse_vrp(path):
                 dimension = int(value)
             elif key == "CAPACITY":
                 capacity = int(value)
+            elif key == "NAME":
+                name = value
+            elif key == "COMMENT":
+                # the Augerat files carry their known optimum in the comment, which
+                # saves keeping a separate table of them in step with the instances
+                found = re.search(r"Optimal value:\s*(\d+)", value)
+                if found:
+                    optimum = int(found.group(1))
         elif section == "coord":
             raw_id, x, y = line.split()
             raw_coords[int(raw_id)] = (float(x), float(y))
@@ -50,6 +62,8 @@ def parse_vrp(path):
 
     coords = np.array([raw_coords[i] for i in order])
     return {
+        "name": name,
+        "optimum": optimum,
         "coords": coords,
         "demands": np.array([raw_demands[i] for i in order]),
         "dist": compute_distance_matrix(coords),
