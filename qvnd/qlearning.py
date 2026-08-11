@@ -8,9 +8,8 @@ N_STATES = N_PHASES * N_IMPROVED
 
 
 class QAgent:
-    # tabular Q-learning over a |S| x |A| table. One instance is meant to live for a
-    # whole run and be shared across every vnd() call in it: the table is the learned
-    # state, so rebuilding the agent per call throws the learning away.
+    # tabular Q-learning. One instance lives for a whole run and is shared across
+    # every vnd() call in it -- rebuilding it per call throws the learning away.
 
     def __init__(self, n_actions, alpha, gamma, eps_start, eps_end, seed=None):
         self.q = np.zeros((N_STATES, n_actions))
@@ -23,10 +22,8 @@ class QAgent:
         self._progress = lambda: 0.0
 
     def set_progress(self, progress):
-        # the runner hands over the same clock the phase feature reads. Epsilon has to
-        # decay on the budget rather than on a step count: the budget is what is fixed,
-        # and step counts differ between arms by up to a factor of two, which would
-        # decay the schedules at different rates and bias the comparison.
+        # epsilon decays on the budget, not on a step count: steps differ between
+        # arms by up to 2x, which would decay the schedules at different rates
         self._progress = progress
 
     @property

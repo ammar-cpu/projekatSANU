@@ -1,0 +1,49 @@
+{
+  "written": "2026-08-10 22:47:29",
+  "runs": 90,
+  "instances": [
+    "A-n62-k8",
+    "A-n65-k9",
+    "A-n80-k10"
+  ],
+  "arms": [
+    "fixed",
+    "q",
+    "random"
+  ],
+  "seeds": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9
+  ],
+  "mode": "time",
+  "time_budget": 20.0,
+  "max_iterations": "",
+  "comparable_across_arms": true,
+  "neighborhoods": [
+    "relocate",
+    "swap",
+    "two_opt",
+    "or_opt",
+    "cross_exchange"
+  ],
+  "config": {
+    "cfg_k_min": 1,
+    "cfg_k_step": 1,
+    "cfg_k_max": 12,
+    "cfg_e": 5,
+    "cfg_reverse_p": 0.0,
+    "cfg_reward": "improvement",
+    "cfg_alpha": 0.1,
+    "cfg_gamma": 0.9,
+    "cfg_eps_start": 0.9,
+    "cfg_eps_end": 0.05
+  }
+}

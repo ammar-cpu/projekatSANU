@@ -12,8 +12,7 @@ from .vnd import DEFAULT_NEIGHBORHOODS, REWARDS, FixedSelector, RandomSelector
 
 ARMS = ("fixed", "random", "q")
 
-# the agent's own knobs, kept apart from the search knobs so a sweep can vary one
-# without disturbing the other
+# kept apart from the search knobs so a sweep can vary one without the other
 DEFAULT_AGENT = {"alpha": 0.1, "gamma": 0.9, "eps_start": 0.9, "eps_end": 0.05}
 
 DEFAULT_SEARCH = {"k_min": 1, "k_step": 1, "k_max": 12, "e": SHAKE_E,
@@ -32,12 +31,8 @@ def make_selector(arm, seed, n_actions=len(DEFAULT_NEIGHBORHOODS), agent=None):
 
 def run_single(instance_path, arm, seed, budget_seconds=None, max_iterations=None,
                search=None, agent=None, neighborhoods=DEFAULT_NEIGHBORHOODS):
-    # one (instance, arm, seed) run under exactly one stopping mode. The returned row
-    # carries the configuration alongside the result so a stored CSV explains itself
-    # without a lab notebook.
-    #
-    # Which mode a table came from matters when reading it: only the timed mode
-    # supports claims about one arm beating another. See gvns() for why.
+    # one (instance, arm, seed) run. The row carries its own configuration so a
+    # stored CSV explains itself. Only the timed mode supports arm-vs-arm claims.
     search = {**DEFAULT_SEARCH, **(search or {})}
     agent = {**DEFAULT_AGENT, **(agent or {})}
 
@@ -90,15 +85,15 @@ def run_batch(instance_paths, arms, seeds, budget_seconds=None, max_iterations=N
                                  search, agent, neighborhoods)
                 rows.append(row)
                 if log:
+                    # flushed: a redirected stdout shows nothing for tens of minutes
                     log(f"{row['instance']:11} {arm:6} seed={seed:<3} "
                         f"cost={row['cost']:.0f} gap={row['gap']:5.2f}% "
-                        f"iter={row['iterations']} acc={row['accepted']}")
+                        f"iter={row['iterations']} acc={row['accepted']}", flush=True)
     return rows
 
 
 def save_results_csv(rows, path):
-    # the CSV holds one row per run; the sidecar JSON holds what every row shares,
-    # so a result can be traced back to the code path that produced it
+    # one row per run in the CSV, what they all share in a sidecar JSON
     path = Path(path)
     with path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
@@ -124,7 +119,7 @@ def save_results_csv(rows, path):
 
 
 def summarize(rows):
-    # one line per (instance, arm): best, mean, spread and gap to the known optimum
+    # one line per (instance, arm)
     out = []
     for instance in sorted({r["instance"] for r in rows}):
         for arm in [a for a in ARMS if any(r["arm"] == a for r in rows)]:
@@ -146,8 +141,7 @@ def summarize(rows):
 
 
 def paired_comparison(rows, first, second, instance=None):
-    # arms share seeds, so comparing them seed by seed removes the run-to-run spread
-    # that swamps an unpaired mean difference
+    # pairing by seed removes the run-to-run spread that swamps an unpaired diff
     costs = {}
     for r in rows:
         if instance is None or r["instance"] == instance:

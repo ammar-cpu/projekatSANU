@@ -9,9 +9,8 @@ EARLY, MID, LATE = 0, 1, 2
 
 
 def phase_of(progress):
-    # early/mid/late thirds of the run. `progress` is the fraction of the overall
-    # budget consumed and comes from outside: a single VND call is far too short
-    # to have phases of its own.
+    # early/mid/late thirds of the run. progress comes from outside: one VND call
+    # is far too short to have phases of its own.
     if progress < 1 / 3:
         return EARLY
     if progress < 2 / 3:
@@ -20,16 +19,14 @@ def phase_of(progress):
 
 
 def _progress_reader(progress):
-    # a plain number freezes the phase for the whole call, which is what standalone
-    # runs and tests want. A zero-argument callable is read again on every iteration,
-    # so a caller holding the wall clock can let the phase move mid-call.
+    # a number freezes the phase for the call; a callable is re-read each iteration
     if callable(progress):
         return progress
     return lambda: progress
 
 
 def elapsed_progress(start, budget):
-    # the callable GVNS passes in: fraction of the time budget consumed so far
+    # fraction of the time budget consumed so far
     return lambda: min(1.0, (time.time() - start) / budget) if budget > 0 else 1.0
 
 
@@ -44,8 +41,8 @@ REWARDS = {"improvement": improvement_reward}
 
 
 class VndStats:
-    # per-neighborhood bookkeeping. Different orders tend to land on the same local
-    # optimum, so the work spent getting there is what separates them, not the cost.
+    # per-neighborhood bookkeeping: orders mostly reach the same local optimum,
+    # so what separates them is the work spent getting there
     def __init__(self, count):
         self.calls = [0] * count
         self.improvements = [0] * count
@@ -61,9 +58,8 @@ class VndStats:
 
 
 class FixedSelector:
-    # baseline: the lowest-numbered neighborhood still worth trying. Together with
-    # the reset in vnd() this is textbook VND -- start at the first, return to it
-    # after every improvement, move on only once one fails.
+    # lowest-numbered neighborhood still worth trying; with the reset in vnd()
+    # this is textbook VND
     def pick(self, state, available):
         return min(available)
 
@@ -72,8 +68,7 @@ class FixedSelector:
 
 
 class RandomSelector:
-    # uniform choice among the neighborhoods still eligible. This is the control
-    # arm: a Q-agent that cannot beat an unbiased choice has learned nothing.
+    # control arm: a Q-agent that cannot beat an unbiased choice learned nothing
     def __init__(self, seed=None):
         self.rng = random.Random(seed)
 
@@ -86,15 +81,13 @@ class RandomSelector:
 
 def vnd(inst, sol, neighborhoods, selector, progress=0.0, failure_penalty=0.0,
         reward=improvement_reward):
-    # `selector` decides which neighborhood to try next. FixedSelector reproduces the
-    # baseline and a Q-agent plugs into the same interface, keeping the comparison fair.
+    # every selector sees the same interface, which is what keeps the comparison fair
     stats = VndStats(len(neighborhoods))
     read_progress = _progress_reader(progress)
     improved_previously = 0
 
-    # a neighborhood that failed on the current solution fails again until the
-    # solution changes, so it is parked until the next improvement. This is what
-    # makes the loop terminate whatever the selector does.
+    # a failed neighborhood fails again until the solution changes, so it is parked
+    # until the next improvement. This is what makes the loop terminate.
     exhausted = set()
 
     while len(exhausted) < len(neighborhoods):
@@ -118,8 +111,7 @@ def vnd(inst, sol, neighborhoods, selector, progress=0.0, failure_penalty=0.0,
 
         value = reward(gain, before, improved, failure_penalty)
         improved_previously = 1 if improved else 0
-        # read again after the move: at a phase boundary the agent transitions into
-        # the new phase, and that is the state the Q-update has to bootstrap from
+        # re-read: at a phase boundary this is the state the Q-update bootstraps from
         next_state = (phase_of(read_progress()), improved_previously)
         selector.update(state, action, value, next_state)
         stats.record(action, improved, gain)

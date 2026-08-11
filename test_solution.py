@@ -1413,7 +1413,10 @@ def test_run_batch_covers_the_grid_and_writes_a_documented_csv(tmp_path=None):
     import json as _json
     import tempfile
 
-    rows = run_batch([INSTANCE], ["fixed", "random"], range(2), budget_seconds=1.0, log=None)
+    seen = []
+    rows = run_batch([INSTANCE], ["fixed", "random"], range(2), budget_seconds=1.0,
+                     log=lambda line, flush=False: seen.append(line))
+    assert len(seen) == 4  # the progress logger is called once per finished run
     assert len(rows) == 4
     assert {(r["arm"], r["seed"]) for r in rows} == {("fixed", 0), ("fixed", 1),
                                                      ("random", 0), ("random", 1)}
