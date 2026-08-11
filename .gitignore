@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Testing / type checking / linting caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Exploratory runs land at the repo root and stay out of git.
+# Runs that back a claim go in results/ and are tracked on purpose.
+/*.csv
+/results_*.json
+plots/
+figures/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local assistant config and project notes
+.claude/settings.local.json
+CLAUDE.md
+handout.md
