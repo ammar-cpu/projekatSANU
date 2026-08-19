@@ -30,14 +30,34 @@ def elapsed_progress(start, budget):
     return lambda: min(1.0, (time.time() - start) / budget) if budget > 0 else 1.0
 
 
-def improvement_reward(gain, cost_before, improved, failure_penalty):
+def improvement_reward(gain, cost_before, improved, elapsed_ms, failure_penalty):
     # relative drop in cost, so the scale does not depend on the instance
     if not improved:
         return failure_penalty
     return gain / cost_before if cost_before > 0 else 0.0
 
 
-REWARDS = {"improvement": improvement_reward}
+REFERENCE_CALL_MS = 0.02  # measured median neighborhood call across instances
+FLOOR_CALL_MS = 0.001     # clock-resolution guard, below the fastest observed call
+
+
+def improvement_per_second(gain, cost_before, improved, elapsed_ms, failure_penalty):
+    # Under a fixed time budget the currency is improvement per unit time, so paying
+    # per attempt misprices the actions: a scan costs anywhere from 0.001 to 3.4 ms,
+    # ~29x between the cheapest and dearest neighborhood at the median.
+    # Scaled by the reference call so a median-cost attempt scores exactly what
+    # improvement_reward would, keeping Q values in the range earlier runs used.
+    scale = REFERENCE_CALL_MS / max(elapsed_ms, FLOOR_CALL_MS)
+    if not improved:
+        # a costly dead end wastes more of the budget than a cheap one
+        return failure_penalty / scale
+    return (gain / cost_before if cost_before > 0 else 0.0) * scale
+
+
+REWARDS = {
+    "improvement": improvement_reward,
+    "improvement_per_second": improvement_per_second,
+}
 
 
 class VndStats:
@@ -46,14 +66,19 @@ class VndStats:
     def __init__(self, count):
         self.calls = [0] * count
         self.improvements = [0] * count
+        # gain and time per neighborhood, to price a success against what it costs
+        self.gains = [0.0] * count
+        self.millis = [0.0] * count
         self.steps = 0
         self.gain = 0.0
 
-    def record(self, action, improved, gain):
+    def record(self, action, improved, gain, elapsed_ms):
         self.steps += 1
         self.calls[action] += 1
+        self.millis[action] += elapsed_ms
         if improved:
             self.improvements[action] += 1
+            self.gains[action] += gain
             self.gain += gain
 
 
@@ -101,7 +126,9 @@ def vnd(inst, sol, neighborhoods, selector, progress=0.0, failure_penalty=0.0,
             )
 
         before = sol.cost
+        started = time.perf_counter()
         improved = neighborhoods[action](inst, sol)
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
         gain = before - sol.cost
 
         if improved:
@@ -109,11 +136,11 @@ def vnd(inst, sol, neighborhoods, selector, progress=0.0, failure_penalty=0.0,
         else:
             exhausted.add(action)
 
-        value = reward(gain, before, improved, failure_penalty)
+        value = reward(gain, before, improved, elapsed_ms, failure_penalty)
         improved_previously = 1 if improved else 0
         # re-read: at a phase boundary this is the state the Q-update bootstraps from
         next_state = (phase_of(read_progress()), improved_previously)
         selector.update(state, action, value, next_state)
-        stats.record(action, improved, gain)
+        stats.record(action, improved, gain, elapsed_ms)
 
     return stats

@@ -62,12 +62,16 @@ class GvnsStats:
         self.vnd_steps = 0
         self.calls = [0] * n_actions
         self.improvements = [0] * n_actions
+        self.gains = [0.0] * n_actions
+        self.millis = [0.0] * n_actions
 
     def absorb(self, vnd_stats):
         self.vnd_steps += vnd_stats.steps
-        for a, (c, i) in enumerate(zip(vnd_stats.calls, vnd_stats.improvements)):
-            self.calls[a] += c
-            self.improvements[a] += i
+        for a in range(len(self.calls)):
+            self.calls[a] += vnd_stats.calls[a]
+            self.improvements[a] += vnd_stats.improvements[a]
+            self.gains[a] += vnd_stats.gains[a]
+            self.millis[a] += vnd_stats.millis[a]
 
 
 def gvns(inst, selector, seed, budget_seconds=None, max_iterations=None,

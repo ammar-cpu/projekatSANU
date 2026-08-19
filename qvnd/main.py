@@ -3,6 +3,8 @@ from pathlib import Path
 
 from .experiments import (
     ARMS,
+    NEIGHBORHOODS_BY_NAME,
+    resolve_neighborhoods,
     DEFAULT_AGENT,
     DEFAULT_SEARCH,
     format_comparisons,
@@ -28,6 +30,9 @@ def parse_args(argv=None):
                            "for regression checks and reproducible tables. Not for "
                            "arm-vs-arm claims: arms differ in iteration cost.")
     p.add_argument("--out", default="results.csv")
+    p.add_argument("--neighborhoods", nargs="+", default=list(NEIGHBORHOODS_BY_NAME),
+                   choices=list(NEIGHBORHOODS_BY_NAME),
+                   help="subset of neighborhoods to search with, for ablations")
 
     p.add_argument("--k-max", type=int, default=DEFAULT_SEARCH["k_max"])
     p.add_argument("--e", type=int, default=DEFAULT_SEARCH["e"])
@@ -58,7 +63,7 @@ def main(argv=None):
         budget = 20.0  # timed mode is the default because it is the comparable one
 
     rows = run_batch(paths, args.arms, range(args.seeds), budget, args.max_iterations,
-                     search, agent)
+                     search, agent, resolve_neighborhoods(args.neighborhoods))
     written = save_results_csv(rows, args.out)
 
     print()

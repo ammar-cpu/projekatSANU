@@ -12,6 +12,16 @@ from .vnd import DEFAULT_NEIGHBORHOODS, REWARDS, FixedSelector, RandomSelector
 
 ARMS = ("fixed", "random", "q")
 
+NEIGHBORHOODS_BY_NAME = {f.__name__: f for f in DEFAULT_NEIGHBORHOODS}
+
+
+def resolve_neighborhoods(names):
+    unknown = [n for n in names if n not in NEIGHBORHOODS_BY_NAME]
+    if unknown:
+        raise ValueError(f"unknown neighborhoods {unknown}, "
+                         f"expected from {list(NEIGHBORHOODS_BY_NAME)}")
+    return tuple(NEIGHBORHOODS_BY_NAME[n] for n in names)
+
 # kept apart from the search knobs so a sweep can vary one without the other
 DEFAULT_AGENT = {"alpha": 0.1, "gamma": 0.9, "eps_start": 0.9, "eps_end": 0.05}
 
@@ -67,6 +77,9 @@ def run_single(instance_path, arm, seed, budget_seconds=None, max_iterations=Non
         "epsilon_end": getattr(selector, "epsilon", ""),
         **{f"calls_{f.__name__}": c for f, c in zip(neighborhoods, stats.calls)},
         **{f"impr_{f.__name__}": c for f, c in zip(neighborhoods, stats.improvements)},
+        **{f"gain_{f.__name__}": round(g, 3) for f, g in zip(neighborhoods, stats.gains)},
+        **{f"ms_{f.__name__}": round(m, 3) for f, m in zip(neighborhoods, stats.millis)},
+        "cfg_neighborhoods": "+".join(f.__name__ for f in neighborhoods),
         "mode": "iterations" if max_iterations is not None else "time",
         "time_budget": budget_seconds if budget_seconds is not None else "",
         "max_iterations": max_iterations if max_iterations is not None else "",

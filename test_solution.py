@@ -36,6 +36,10 @@ from qvnd.gvns import SHAKE_E, gvns, shake
 from qvnd.qlearning import N_STATES, QAgent
 from qvnd.vnd import (
     DEFAULT_NEIGHBORHOODS,
+    REFERENCE_CALL_MS,
+    REWARDS,
+    improvement_per_second,
+    improvement_reward,
     EARLY,
     LATE,
     MID,
@@ -856,6 +860,48 @@ class _RecordingSelector:
         self.updates.append((state, action, reward, next_state))
 
 
+def test_reward_registry_holds_both_functions():
+    assert set(REWARDS) == {"improvement", "improvement_per_second"}
+
+
+def test_improvement_reward_ignores_time():
+    # the per-attempt reward must not change when the same move takes longer
+    fast = improvement_reward(10.0, 1000.0, True, 0.001, 0.0)
+    slow = improvement_reward(10.0, 1000.0, True, 5.0, 0.0)
+    assert fast == slow == 0.01
+    assert improvement_reward(0.0, 1000.0, False, 5.0, -0.5) == -0.5
+
+
+def test_improvement_per_second_matches_the_old_reward_at_median_cost():
+    # a median-cost call scores exactly what the per-attempt reward would, which is
+    # what keeps Q magnitudes comparable across the two reward functions
+    plain = improvement_reward(10.0, 1000.0, True, REFERENCE_CALL_MS, 0.0)
+    timed = improvement_per_second(10.0, 1000.0, True, REFERENCE_CALL_MS, 0.0)
+    assert abs(plain - timed) < 1e-12
+
+
+def test_improvement_per_second_prefers_the_cheaper_call():
+    cheap = improvement_per_second(10.0, 1000.0, True, 0.005, 0.0)
+    dear = improvement_per_second(10.0, 1000.0, True, 0.160, 0.0)
+    assert cheap > dear
+    assert abs(cheap / dear - 32.0) < 1e-6  # ratio is exactly the ratio of times
+
+
+def test_improvement_per_second_punishes_the_costlier_dead_end():
+    cheap_miss = improvement_per_second(0.0, 1000.0, False, 0.005, -1.0)
+    dear_miss = improvement_per_second(0.0, 1000.0, False, 0.160, -1.0)
+    assert dear_miss < cheap_miss < 0
+    # with the default penalty the term is inert, exactly as in the per-attempt reward
+    assert improvement_per_second(0.0, 1000.0, False, 5.0, 0.0) == 0.0
+
+
+def test_improvement_per_second_floors_instant_calls():
+    # a call timed at zero must not divide by zero or blow the reward up unboundedly
+    floored = improvement_per_second(10.0, 1000.0, True, 0.0, 0.0)
+    assert floored == improvement_per_second(10.0, 1000.0, True, 1e-9, 0.0)
+    assert floored == 0.01 * (REFERENCE_CALL_MS / 0.001)
+
+
 def test_phase_of_thirds():
     assert phase_of(0.0) == EARLY
     assert phase_of(0.32) == EARLY
@@ -939,6 +985,11 @@ def test_vnd_stats_add_up():
     assert sum(stats.calls) == stats.steps
     assert all(good <= total for good, total in zip(stats.improvements, stats.calls))
     assert abs(stats.gain - (start - sol.cost)) < 1e-6
+    assert abs(sum(stats.gains) - stats.gain) < 1e-6   # per-neighborhood gains partition it
+    # a neighborhood only banks gain when it improved, and never without being called
+    for calls, improvements, gain in zip(stats.calls, stats.improvements, stats.gains):
+        assert gain >= 0.0 and (gain == 0.0 or improvements > 0)
+        assert improvements == 0 or calls > 0
     # every neighborhood has to be tried at least once before VND may stop
     assert all(count > 0 for count in stats.calls)
 
@@ -1375,6 +1426,27 @@ def test_gvns_k_wraps_around_instead_of_growing_without_bound():
     assert sizes.count(1) > 1  # wrapped back round at least once
 
 
+def test_resolve_neighborhoods_maps_names_and_rejects_unknown():
+    from qvnd.experiments import resolve_neighborhoods
+    assert resolve_neighborhoods(["relocate", "swap"]) == (relocate, swap)
+    assert resolve_neighborhoods([f.__name__ for f in DEFAULT_NEIGHBORHOODS]) \
+        == tuple(DEFAULT_NEIGHBORHOODS)
+    try:
+        resolve_neighborhoods(["relocate", "teleport"])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError for an unknown neighborhood")
+
+
+def test_run_single_honours_a_neighborhood_subset():
+    subset = (relocate, swap)
+    row = run_single(INSTANCE, "random", seed=0, budget_seconds=2.0, neighborhoods=subset)
+    assert row["cfg_neighborhoods"] == "relocate+swap"
+    assert sum(row[f"calls_{f.__name__}"] for f in subset) == row["vnd_steps"]
+    assert "calls_cross_exchange" not in row  # the excluded ones are not reported at all
+
+
 def test_make_selector_covers_every_arm():
     for arm in ARMS:
         selector = make_selector(arm, seed=0)
@@ -1406,6 +1478,12 @@ def test_run_single_records_result_and_configuration():
     assert row["cfg_reward"] == "improvement"
     assert row["mode"] == "time" and row["time_budget"] == 2.0
     assert sum(row[f"calls_{f.__name__}"] for f in DEFAULT_NEIGHBORHOODS) == row["vnd_steps"]
+
+    # per-neighborhood gain and time have to add up to the run-level figures
+    for f in DEFAULT_NEIGHBORHOODS:
+        assert row[f"gain_{f.__name__}"] >= 0.0
+        assert row[f"ms_{f.__name__}"] > 0.0   # every neighborhood is tried at least once
+    assert sum(row[f"ms_{f.__name__}"] for f in DEFAULT_NEIGHBORHOODS) < row["wall"] * 1000
 
 
 def test_run_batch_covers_the_grid_and_writes_a_documented_csv(tmp_path=None):
