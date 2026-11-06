@@ -1,5 +1,6 @@
 import random
 import time
+from collections import namedtuple
 
 from .local_search import cross_exchange, or_opt, relocate, swap, two_opt
 
@@ -30,33 +31,57 @@ def elapsed_progress(start, budget):
     return lambda: min(1.0, (time.time() - start) / budget) if budget > 0 else 1.0
 
 
-def improvement_reward(gain, cost_before, improved, elapsed_ms, failure_penalty):
+Attempt = namedtuple(
+    "Attempt", "gain cost_before improved elapsed_ms n_exhausted n_actions"
+)
+
+
+def _relative_gain(a):
+    return a.gain / a.cost_before if a.cost_before > 0 else 0.0
+
+
+def improvement_reward(a, failure_penalty):
     # relative drop in cost, so the scale does not depend on the instance
-    if not improved:
-        return failure_penalty
-    return gain / cost_before if cost_before > 0 else 0.0
+    return _relative_gain(a) if a.improved else failure_penalty
 
 
 REFERENCE_CALL_MS = 0.02  # measured median neighborhood call across instances
 FLOOR_CALL_MS = 0.001     # clock-resolution guard, below the fastest observed call
 
 
-def improvement_per_second(gain, cost_before, improved, elapsed_ms, failure_penalty):
-    # Under a fixed time budget the currency is improvement per unit time, so paying
-    # per attempt misprices the actions: a scan costs anywhere from 0.001 to 3.4 ms,
-    # ~29x between the cheapest and dearest neighborhood at the median.
+def improvement_per_second(a, failure_penalty):
+    # Under a fixed time budget the currency is improvement per unit time: a scan
+    # costs 0.001 to 3.4 ms, ~29x between the cheapest and dearest at the median.
     # Scaled by the reference call so a median-cost attempt scores exactly what
     # improvement_reward would, keeping Q values in the range earlier runs used.
-    scale = REFERENCE_CALL_MS / max(elapsed_ms, FLOOR_CALL_MS)
-    if not improved:
+    scale = REFERENCE_CALL_MS / max(a.elapsed_ms, FLOOR_CALL_MS)
+    if not a.improved:
         # a costly dead end wastes more of the budget than a cheap one
         return failure_penalty / scale
-    return (gain / cost_before if cost_before > 0 else 0.0) * scale
+    return _relative_gain(a) * scale
+
+
+MARGINAL_REFERENCE = 10.0  # 1/mean scale over the measured |exhausted| distribution
+
+
+def marginal_improvement(a, failure_penalty):
+    # Credit an improvement by how much of the neighborhood set demonstrably failed
+    # on this same solution first. An improvement found while nothing is exhausted is
+    # one any neighborhood could likely have found -- measured, every neighborhood
+    # succeeds ~90% there -- so it earns nothing; one found after the others have
+    # given up is non-redundant by observation, not by assumption, and earns full
+    # credit. Scaled by the reference so Q magnitudes stay comparable; that factor
+    # cannot affect the policy, which is invariant to a positive scalar.
+    if not a.improved:
+        return failure_penalty
+    share = a.n_exhausted / (a.n_actions - 1) if a.n_actions > 1 else 1.0
+    return _relative_gain(a) * share * MARGINAL_REFERENCE
 
 
 REWARDS = {
     "improvement": improvement_reward,
     "improvement_per_second": improvement_per_second,
+    "marginal_improvement": marginal_improvement,
 }
 
 
@@ -117,6 +142,7 @@ def vnd(inst, sol, neighborhoods, selector, progress=0.0, failure_penalty=0.0,
 
     while len(exhausted) < len(neighborhoods):
         available = [a for a in range(len(neighborhoods)) if a not in exhausted]
+        n_exhausted = len(exhausted)
         state = (phase_of(read_progress()), improved_previously)
 
         action = selector.pick(state, available)
@@ -136,7 +162,10 @@ def vnd(inst, sol, neighborhoods, selector, progress=0.0, failure_penalty=0.0,
         else:
             exhausted.add(action)
 
-        value = reward(gain, before, improved, elapsed_ms, failure_penalty)
+        value = reward(
+            Attempt(gain, before, improved, elapsed_ms, n_exhausted, len(neighborhoods)),
+            failure_penalty,
+        )
         improved_previously = 1 if improved else 0
         # re-read: at a phase boundary this is the state the Q-update bootstraps from
         next_state = (phase_of(read_progress()), improved_previously)

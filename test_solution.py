@@ -36,10 +36,13 @@ from qvnd.gvns import SHAKE_E, gvns, shake
 from qvnd.qlearning import N_STATES, QAgent
 from qvnd.vnd import (
     DEFAULT_NEIGHBORHOODS,
+    MARGINAL_REFERENCE,
     REFERENCE_CALL_MS,
     REWARDS,
+    Attempt,
     improvement_per_second,
     improvement_reward,
+    marginal_improvement,
     EARLY,
     LATE,
     MID,
@@ -860,46 +863,75 @@ class _RecordingSelector:
         self.updates.append((state, action, reward, next_state))
 
 
-def test_reward_registry_holds_both_functions():
-    assert set(REWARDS) == {"improvement", "improvement_per_second"}
+def _attempt(gain=10.0, cost_before=1000.0, improved=True, elapsed_ms=0.02,
+             n_exhausted=0, n_actions=5):
+    return Attempt(gain, cost_before, improved, elapsed_ms, n_exhausted, n_actions)
 
 
-def test_improvement_reward_ignores_time():
-    # the per-attempt reward must not change when the same move takes longer
-    fast = improvement_reward(10.0, 1000.0, True, 0.001, 0.0)
-    slow = improvement_reward(10.0, 1000.0, True, 5.0, 0.0)
-    assert fast == slow == 0.01
-    assert improvement_reward(0.0, 1000.0, False, 5.0, -0.5) == -0.5
+def test_reward_registry_holds_every_function():
+    assert set(REWARDS) == {"improvement", "improvement_per_second",
+                            "marginal_improvement"}
+
+
+def test_improvement_reward_ignores_time_and_exhaustion():
+    # the per-attempt reward must not move with anything but the gain itself
+    assert improvement_reward(_attempt(elapsed_ms=0.001), 0.0) == 0.01
+    assert improvement_reward(_attempt(elapsed_ms=5.0), 0.0) == 0.01
+    assert improvement_reward(_attempt(n_exhausted=4), 0.0) == 0.01
+    assert improvement_reward(_attempt(gain=0.0, improved=False), -0.5) == -0.5
 
 
 def test_improvement_per_second_matches_the_old_reward_at_median_cost():
     # a median-cost call scores exactly what the per-attempt reward would, which is
     # what keeps Q magnitudes comparable across the two reward functions
-    plain = improvement_reward(10.0, 1000.0, True, REFERENCE_CALL_MS, 0.0)
-    timed = improvement_per_second(10.0, 1000.0, True, REFERENCE_CALL_MS, 0.0)
-    assert abs(plain - timed) < 1e-12
+    a = _attempt(elapsed_ms=REFERENCE_CALL_MS)
+    assert abs(improvement_reward(a, 0.0) - improvement_per_second(a, 0.0)) < 1e-12
 
 
 def test_improvement_per_second_prefers_the_cheaper_call():
-    cheap = improvement_per_second(10.0, 1000.0, True, 0.005, 0.0)
-    dear = improvement_per_second(10.0, 1000.0, True, 0.160, 0.0)
+    cheap = improvement_per_second(_attempt(elapsed_ms=0.005), 0.0)
+    dear = improvement_per_second(_attempt(elapsed_ms=0.160), 0.0)
     assert cheap > dear
     assert abs(cheap / dear - 32.0) < 1e-6  # ratio is exactly the ratio of times
 
 
 def test_improvement_per_second_punishes_the_costlier_dead_end():
-    cheap_miss = improvement_per_second(0.0, 1000.0, False, 0.005, -1.0)
-    dear_miss = improvement_per_second(0.0, 1000.0, False, 0.160, -1.0)
-    assert dear_miss < cheap_miss < 0
+    miss = lambda ms: _attempt(gain=0.0, improved=False, elapsed_ms=ms)
+    assert improvement_per_second(miss(0.160), -1.0) < improvement_per_second(miss(0.005), -1.0) < 0
     # with the default penalty the term is inert, exactly as in the per-attempt reward
-    assert improvement_per_second(0.0, 1000.0, False, 5.0, 0.0) == 0.0
+    assert improvement_per_second(miss(5.0), 0.0) == 0.0
 
 
 def test_improvement_per_second_floors_instant_calls():
     # a call timed at zero must not divide by zero or blow the reward up unboundedly
-    floored = improvement_per_second(10.0, 1000.0, True, 0.0, 0.0)
-    assert floored == improvement_per_second(10.0, 1000.0, True, 1e-9, 0.0)
+    floored = improvement_per_second(_attempt(elapsed_ms=0.0), 0.0)
+    assert floored == improvement_per_second(_attempt(elapsed_ms=1e-9), 0.0)
     assert floored == 0.01 * (REFERENCE_CALL_MS / 0.001)
+
+
+def test_marginal_improvement_pays_nothing_when_nothing_is_exhausted():
+    # at |E|=0 every neighborhood succeeds ~90%, so a success there carries no
+    # evidence that this one was needed
+    assert marginal_improvement(_attempt(n_exhausted=0), 0.0) == 0.0
+
+
+def test_marginal_improvement_pays_full_credit_when_the_rest_have_failed():
+    full = marginal_improvement(_attempt(n_exhausted=4), 0.0)
+    assert abs(full - 0.01 * MARGINAL_REFERENCE) < 1e-12
+
+
+def test_marginal_improvement_scales_with_the_share_that_failed():
+    values = [marginal_improvement(_attempt(n_exhausted=e), 0.0) for e in range(5)]
+    assert values == sorted(values)
+    steps = [b - a for a, b in zip(values, values[1:])]
+    assert max(steps) - min(steps) < 1e-12  # equal steps: the share is linear in |E|
+
+
+def test_marginal_improvement_ignores_time_and_keeps_the_penalty_flat():
+    fast = marginal_improvement(_attempt(n_exhausted=2, elapsed_ms=0.001), 0.0)
+    slow = marginal_improvement(_attempt(n_exhausted=2, elapsed_ms=5.0), 0.0)
+    assert fast == slow
+    assert marginal_improvement(_attempt(gain=0.0, improved=False, n_exhausted=3), -0.5) == -0.5
 
 
 def test_phase_of_thirds():
